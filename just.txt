@@ -1,0 +1,382 @@
+// first code 
+
+import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+def load_and_chunk_file(file_path, chunk_size=300, overlap=50):
+    """Reads a text file and splits it into overlapping string chunks."""
+    with open(file_path, "r", encoding="utf-8") as f:
+        text = f.read()
+
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        start += chunk_size - overlap  # Slide window with overlap
+
+    return chunks
+
+if __name__ == "__main__":
+    # Test chunking
+    file_path = "sample_policy.txt"
+    chunks = load_and_chunk_file(file_path)
+
+    print(f"Successfully loaded '{file_path}'")
+    print(f"Total Chunks Created: {len(chunks)}\n")
+
+    print("--- Sample Chunk 1 ---")
+    print(chunks[0])
+    print("\n--- Sample Chunk 2 ---")
+    print(chunks[1])
+
+
+// second code 
+
+import os
+from dotenv import load_dotenv
+import chromadb
+from rank_bm25 import BM25Okapi
+
+# Load environment variables
+load_dotenv()
+
+def load_and_chunk_file(file_path, chunk_size=300, overlap=50):
+    """Reads a text file and splits it into overlapping string chunks."""
+    with open(file_path, "r", encoding="utf-8") as f:
+        text = f.read()
+
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        start += chunk_size - overlap
+
+    return chunks
+
+
+class HybridIndexer:
+    def __init__(self, chunks):
+        self.chunks = chunks
+
+        # 1. Setup BM25 (Sparse Keyword Search)
+        # Tokenize each chunk by splitting into lowercase words
+        tokenized_corpus = [chunk.lower().split(" ") for chunk in self.chunks]
+        self.bm25 = BM25Okapi(tokenized_corpus)
+
+        # 2. Setup ChromaDB (Dense Vector Search)
+        # ChromaDB downloads a free Hugging Face embedding model locally
+        self.chroma_client = chromadb.Client()
+        self.collection = self.chroma_client.create_collection(name="policy_docs")
+
+        # Add chunks to ChromaDB
+        ids = [f"doc_{i}" for i in range(len(self.chunks))]
+        self.collection.add(
+            documents=self.chunks,
+            ids=ids
+        )
+
+    def search_bm25(self, query, top_k=2):
+        """Sparse keyword search using BM25."""
+        tokenized_query = query.lower().split(" ")
+        scores = self.bm25.get_scores(tokenized_query)
+        # Sort indices by highest score
+        top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
+        return [self.chunks[i] for i in top_indices]
+
+    def search_dense(self, query, top_k=2):
+        """Dense semantic search using ChromaDB."""
+        results = self.collection.query(
+            query_texts=[query],
+            n_results=top_k
+        )
+        return results['documents'][0]
+
+
+if __name__ == "__main__":
+    file_path = "sample_policy.txt"
+    chunks = load_and_chunk_file(file_path)
+    
+    print("⏳ Initializing Hybrid Indexes (BM25 + ChromaDB)...")
+    indexer = HybridIndexer(chunks)
+    print("✅ Indexes ready!\n")
+
+    # Test Query
+    test_query = "What is the policy for medical certificate on sick leave?"
+    print(f"🔍 Test Query: '{test_query}'\n")
+
+    bm25_results = indexer.search_bm25(test_query, top_k=1)
+    print("--- BM25 Keyword Search Top Result ---")
+    print(bm25_results[0])
+
+    dense_results = indexer.search_dense(test_query, top_k=1)
+    print("\n--- ChromaDB Vector Search Top Result ---")
+    print(dense_results[0])
+
+
+
+// third code 
+
+import os
+from dotenv import load_dotenv
+import chromadb
+from rank_bm25 import BM25Okapi
+from sentence_transformers import CrossEncoder
+
+# Load environment variables
+load_dotenv()
+
+def load_and_chunk_file(file_path, chunk_size=300, overlap=50):
+    """Reads a text file and splits it into overlapping string chunks."""
+    with open(file_path, "r", encoding="utf-8") as f:
+        text = f.read()
+
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        start += chunk_size - overlap
+
+    return chunks
+
+
+class HybridIndexer:
+    def __init__(self, chunks):
+        self.chunks = chunks
+
+        # 1. Setup BM25 (Sparse Keyword Search)
+        tokenized_corpus = [chunk.lower().split(" ") for chunk in self.chunks]
+        self.bm25 = BM25Okapi(tokenized_corpus)
+
+        # 2. Setup ChromaDB (Dense Vector Search)
+        self.chroma_client = chromadb.Client()
+        self.collection = self.chroma_client.create_collection(name="policy_docs")
+
+        ids = [f"doc_{i}" for i in range(len(self.chunks))]
+        self.collection.add(
+            documents=self.chunks,
+            ids=ids
+        )
+
+        # 3. Setup Cross-Encoder Reranker (Runs on CPU, lightweight)
+        print("⏳ Loading Cross-Encoder model...")
+        self.reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+
+    def search_bm25(self, query, top_k=3):
+        """Sparse keyword search using BM25."""
+        tokenized_query = query.lower().split(" ")
+        scores = self.bm25.get_scores(tokenized_query)
+        top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
+        return [self.chunks[i] for i in top_indices]
+
+    def search_dense(self, query, top_k=3):
+        """Dense semantic search using ChromaDB."""
+        results = self.collection.query(
+            query_texts=[query],
+            n_results=top_k
+        )
+        return results['documents'][0]
+
+    def hybrid_rerank_search(self, query, top_k=1):
+        """Merges BM25 + Dense results via RRF, then reranks with Cross-Encoder."""
+        bm25_hits = self.search_bm25(query, top_k=3)
+        dense_hits = self.search_dense(query, top_k=3)
+
+        # Combine unique chunks from both lists
+        candidate_chunks = list(set(bm25_hits + dense_hits))
+
+        # Create (query, chunk) pairs for Cross-Encoder scoring
+        pairs = [[query, chunk] for chunk in candidate_chunks]
+        scores = self.reranker.predict(pairs)
+
+        # Sort candidate chunks by Cross-Encoder score (highest first)
+        scored_chunks = sorted(zip(candidate_chunks, scores), key=lambda x: x[1], reverse=True)
+
+        # Return top_k best chunks
+        return [chunk for chunk, score in scored_chunks[:top_k]]
+
+
+if __name__ == "__main__":
+    file_path = "sample_policy.txt"
+    chunks = load_and_chunk_file(file_path)
+    
+    print("⏳ Initializing Hybrid Indexes & Reranker...")
+    indexer = HybridIndexer(chunks)
+    print("✅ System Ready!\n")
+
+    test_query = "What is the monthly allowance for internet expenses?"
+    print(f"🔍 Query: '{test_query}'\n")
+
+    top_chunk = indexer.hybrid_rerank_search(test_query, top_k=1)[0]
+    print("--- 🎯 Top Reranked Chunk Returned ---")
+    print(top_chunk)
+
+
+// fourth code 
+
+import os
+import json
+from dotenv import load_dotenv
+import chromadb
+from rank_bm25 import BM25Okapi
+from sentence_transformers import CrossEncoder, SentenceTransformer, util
+from groq import Groq
+
+# Load environment variables
+load_dotenv()
+
+def load_and_chunk_file(file_path, chunk_size=300, overlap=50):
+    """Reads a text file and splits it into overlapping string chunks."""
+    with open(file_path, "r", encoding="utf-8") as f:
+        text = f.read()
+
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        start += chunk_size - overlap
+
+    return chunks
+
+
+class HybridIndexer:
+    def __init__(self, chunks):
+        self.chunks = chunks
+
+        # 1. BM25 (Sparse Keyword Search)
+        tokenized_corpus = [chunk.lower().split(" ") for chunk in self.chunks]
+        self.bm25 = BM25Okapi(tokenized_corpus)
+
+        # 2. ChromaDB (Dense Vector Search)
+        self.chroma_client = chromadb.Client()
+        self.collection = self.chroma_client.create_collection(name="policy_docs")
+
+        ids = [f"doc_{i}" for i in range(len(self.chunks))]
+        self.collection.add(
+            documents=self.chunks,
+            ids=ids
+        )
+
+        # 3. Cross-Encoder Reranker
+        print("⏳ Loading Cross-Encoder model...")
+        self.reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+
+        # 4. Evaluator Model for Citation Verification
+        print("⏳ Loading Similarity Evaluator model...")
+        self.evaluator = SentenceTransformer("all-MiniLM-L6-v2")
+
+        # 5. Groq LLM Client
+        self.groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+    def search_bm25(self, query, top_k=3):
+        tokenized_query = query.lower().split(" ")
+        scores = self.bm25.get_scores(tokenized_query)
+        top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
+        return [self.chunks[i] for i in top_indices]
+
+    def search_dense(self, query, top_k=3):
+        results = self.collection.query(
+            query_texts=[query],
+            n_results=top_k
+        )
+        return results['documents'][0]
+
+    def hybrid_rerank_search(self, query, top_k=1):
+        bm25_hits = self.search_bm25(query, top_k=3)
+        dense_hits = self.search_dense(query, top_k=3)
+
+        candidate_chunks = list(set(bm25_hits + dense_hits))
+        pairs = [[query, chunk] for chunk in candidate_chunks]
+        scores = self.reranker.predict(pairs)
+
+        scored_chunks = sorted(zip(candidate_chunks, scores), key=lambda x: x[1], reverse=True)
+        return [chunk for chunk, score in scored_chunks[:top_k]]
+
+    def generate_answer(self, query, top_chunk):
+        """Asks Groq LLM to generate an answer and cite its source in strict JSON."""
+        prompt = f"""
+        Context:
+        "{top_chunk}"
+
+        User Query:
+        "{query}"
+
+        Instruction:
+        Answer the query using ONLY the context provided above.
+        You MUST return your answer as a JSON object with two keys:
+        1. "answer": Your concise direct answer.
+        2. "cited_sentence": The exact sentence or chunk from the context that supports your answer.
+
+        JSON Output:
+        """
+
+        response = self.groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            response_format={"type": "json_object"}
+        )
+
+        return json.loads(response.choices[0].message.content)
+
+    def verify_citation(self, cited_sentence, retrieved_chunk, threshold=0.70):
+        """Verifies if the cited sentence actually matches the retrieved document chunk."""
+        emb1 = self.evaluator.encode(cited_sentence, convert_to_tensor=True)
+        emb2 = self.evaluator.encode(retrieved_chunk, convert_to_tensor=True)
+
+        similarity_score = util.cos_sim(emb1, emb2).item()
+        is_verified = similarity_score >= threshold
+
+        return is_verified, round(similarity_score, 4)
+
+
+if __name__ == "__main__":
+    file_path = "sample_policy.txt"
+    chunks = load_and_chunk_file(file_path)
+
+    print("⏳ Initializing Complete Hybrid RAG System...")
+    rag_system = HybridIndexer(chunks)
+    print("✅ System Fully Operational!\n")
+
+    # User Query Test
+    test_query = "Can an employee work from home without approval?"
+    print(f"❓ User Query: '{test_query}'")
+    print("=" * 60)
+
+    # 1. Retrieve Best Chunk
+    top_chunk = rag_system.hybrid_rerank_search(test_query, top_k=1)[0]
+    print(f"\n📌 Top Retrived Chunk:\n\"{top_chunk}\"\n")
+
+    # 2. Generate LLM Answer
+    llm_output = rag_system.generate_answer(test_query, top_chunk)
+    answer = llm_output.get("answer")
+    cited_sentence = llm_output.get("cited_sentence")
+
+    print(f"🤖 LLM Answer:\n{answer}\n")
+    print(f"💬 Citation Provided by LLM:\n\"{cited_sentence}\"\n")
+
+    # 3. Citation Verification Pass
+    is_verified, score = rag_system.verify_citation(cited_sentence, top_chunk)
+
+    print("-" * 60)
+    if is_verified:
+        print(f"✅ CITATION VERIFIED! (Semantic Similarity Score: {score})")
+        print("Status: Answer safely passed verification and can be delivered.")
+    else:
+        print(f"⚠️ CITATION REJECTED / UNVERIFIED! (Semantic Similarity Score: {score})")
+        print("Status: Hallucination or weak citation detected.")
+    print("=" * 60)
