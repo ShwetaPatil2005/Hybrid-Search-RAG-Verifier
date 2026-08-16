@@ -5,14 +5,23 @@ from pypdf import PdfReader
 import chromadb
 from rank_bm25 import BM25Okapi
 from sentence_transformers import CrossEncoder, SentenceTransformer, util
+import torch
+import torch.nn as nn
 from groq import Groq
+import re
 
 # Load environment variables
 load_dotenv()
 
 
+import re
+from pypdf import PdfReader
+
 def load_pdf_and_chunk(pdf_path, chunk_size=800, overlap=150):
-    """Extracts text from a PDF and splits it into overlapping string chunks."""
+    """
+    Sentence-Aware Recursive Chunking:
+    Splits text by complete sentences so words/sentences are never cut in half at chunk boundaries.
+    """
     reader = PdfReader(pdf_path)
     full_text = ""
 
@@ -21,21 +30,48 @@ def load_pdf_and_chunk(pdf_path, chunk_size=800, overlap=150):
         if text:
             full_text += text + "\n"
 
-    # Clean up whitespace
     full_text = full_text.strip()
-
-    # Fallback if PDF has no selectable text (e.g. scanned image PDF)
     if not full_text:
-        return ["Error: No selectable text could be extracted from this PDF. It might be a scanned image PDF."]
+        return ["Error: No selectable text could be extracted from this PDF."]
 
+    # Split full text into complete sentences (preserving punctuation)
+    sentences = re.split(r'(?<=[.?!])\s+', full_text)
+    
     chunks = []
-    start = 0
-    while start < len(full_text):
-        end = start + chunk_size
-        chunk = full_text[start:end].strip()
-        if chunk:
-            chunks.append(chunk)
-        start += chunk_size - overlap
+    current_chunk = []
+    current_length = 0
+
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+            
+        sentence_len = len(sentence)
+        
+        # If adding the sentence exceeds target chunk size, commit the current chunk
+        if current_length + sentence_len > chunk_size and current_chunk:
+            chunk_str = " ".join(current_chunk).strip()
+            chunks.append(chunk_str)
+            
+            # Create overlapping window by keeping trailing sentences
+            overlap_chunk = []
+            overlap_len = 0
+            for s in reversed(current_chunk):
+                if overlap_len + len(s) <= overlap:
+                    overlap_chunk.insert(0, s)
+                    overlap_len += len(s)
+                else:
+                    break
+            
+            current_chunk = overlap_chunk
+            current_length = sum(len(s) for s in current_chunk)
+
+        current_chunk.append(sentence)
+        current_length += sentence_len
+
+    # Add any remaining text as the last chunk
+    if current_chunk:
+        chunks.append(" ".join(current_chunk).strip())
 
     return chunks if chunks else ["Error: Unable to create chunks from document."]
 
@@ -52,23 +88,24 @@ class HybridIndexer:
         # 2. ChromaDB (Dense Vector Search)
         self.chroma_client = chromadb.PersistentClient(path="./chroma_db")
 
-        # Clean up existing collection to prevent duplication across PDF uploads
         try:
             self.chroma_client.delete_collection(name='policy_docs')
         except Exception:
-            pass  # Collection did not exist yet, safe to proceed
+            pass
 
         self.collection = self.chroma_client.create_collection(
             name='policy_docs'
         )
 
-        # Insert chunks using upsert to handle ID updates safely
         ids = [f'doc_{i}' for i in range(len(self.chunks))]
         self.collection.upsert(documents=self.chunks, ids=ids)
 
-        # 3. Cross-Encoder Reranker
+        # 3. Cross-Encoder Reranker (with Sigmoid for normalized 0-1 confidence scoring)
         print('⏳ Loading Cross-Encoder model...')
-        self.reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+        self.reranker = CrossEncoder(
+            'cross-encoder/ms-marco-MiniLM-L-6-v2',
+            default_activation_function=nn.Sigmoid()
+        )
 
         # 4. Evaluator Model for Citation Verification
         print('⏳ Loading Similarity Evaluator model...')
@@ -89,32 +126,45 @@ class HybridIndexer:
         results = self.collection.query(query_texts=[query], n_results=top_k)
         return results['documents'][0]
 
-    def hybrid_rerank_search(self, query, top_k=1):
+    def hybrid_rerank_search(self, query, top_k=1, confidence_threshold=0.35):
+        """
+        Retrieves candidate chunks and evaluates relevance with Cross-Encoder.
+        Applies a Confidence Gate to prevent passing irrelevant context to LLM.
+        """
         bm25_hits = self.search_bm25(query, top_k=3)
         dense_hits = self.search_dense(query, top_k=3)
 
         candidate_chunks = list(set(bm25_hits + dense_hits))
         pairs = [[query, chunk] for chunk in candidate_chunks]
+        
+        # Predict normalized probabilities via Sigmoid activation
         scores = self.reranker.predict(pairs)
 
         scored_chunks = sorted(
             zip(candidate_chunks, scores), key=lambda x: x[1], reverse=True
         )
-        return [chunk for chunk, score in scored_chunks[:top_k]]
+
+        top_chunk, top_score = scored_chunks[0]
+
+        # 🛑 PRE-GENERATION CONFIDENCE GATE
+        # If the highest reranking score is below threshold, context is irrelevant
+        is_relevant = float(top_score) >= confidence_threshold
+
+        return top_chunk, round(float(top_score), 4), is_relevant
 
     def generate_answer(self, query, top_chunk):
         prompt = f"""
+        CRITICAL INSTRUCTIONS:
+        1. Answer the query using ONLY the direct factual statements from the context provided below.
+        2. Do NOT use any external knowledge, extrapolate, or assume facts not explicitly written.
+        3. If the context does NOT contain the direct answer to the query, set "answer" to "I cannot find sufficient information in the provided document to answer this query." and "cited_sentence" to "N/A".
+        4. You MUST return your output as a strict JSON object with keys "answer" and "cited_sentence".
+
         Context:
         "{top_chunk}"
 
         User Query:
         "{query}"
-
-        Instruction:
-        Answer the query using ONLY the context provided above.
-        You MUST return your answer as a JSON object with two keys:
-        1. "answer": Your concise direct answer.
-        2. "cited_sentence": The exact sentence or chunk from the context that supports your answer.
 
         JSON Output:
         """
@@ -122,26 +172,44 @@ class HybridIndexer:
         response = self.groq_client.chat.completions.create(
             model='llama-3.3-70b-versatile',
             messages=[{'role': 'user', 'content': prompt}],
-            temperature=0.1,
+            temperature=0.0,  # Zero temperature for deterministic grounding
             response_format={'type': 'json_object'},
         )
 
-        return json.loads(response.choices[0].message.content)
+        try:
+            return json.loads(response.choices[0].message.content)
+        except Exception:
+            return {
+                "answer": response.choices[0].message.content,
+                "cited_sentence": "N/A"
+            }
 
-    def verify_citation(self, cited_sentence, retrieved_chunk, threshold=0.50):
-        """Verifies if the cited sentence matches or exists inside the retrieved chunk."""
-        clean_citation = cited_sentence.strip().strip('"').strip("'")
-        clean_chunk = retrieved_chunk.strip()
+    def verify_citation(self, cited_sentence, retrieved_chunk, threshold=0.45):
+        """
+        Splits the retrieved chunk into individual sentences and compares 
+        the citation against the best matching sentence rather than the entire 800-char block.
+        """
+        if not cited_sentence or cited_sentence == "N/A":
+            return False, 0.0
 
-        # Direct Substring Check
+        clean_citation = cited_sentence.strip().strip('"').strip("'").lower()
+        clean_chunk = retrieved_chunk.strip().lower()
+
+        # 1. Flexible Substring Check (handles small prefix/boundary cuts)
         if clean_citation in clean_chunk or clean_chunk in clean_citation:
             return True, 1.0
 
-        # Semantic Similarity Fallback
-        emb1 = self.evaluator.encode(clean_citation, convert_to_tensor=True)
-        emb2 = self.evaluator.encode(clean_chunk, convert_to_tensor=True)
+        # 2. Sentence-Level Semantic Matching
+        sentences = [s.strip() for s in retrieved_chunk.split('.') if len(s.strip()) > 10]
+        if not sentences:
+            sentences = [retrieved_chunk]
 
-        similarity_score = util.cos_sim(emb1, emb2).item()
-        is_verified = similarity_score >= threshold
+        emb_citation = self.evaluator.encode(clean_citation, convert_to_tensor=True)
+        emb_sentences = self.evaluator.encode(sentences, convert_to_tensor=True)
 
-        return is_verified, round(similarity_score, 4)
+        # Compare citation to each individual sentence in the chunk
+        similarity_scores = util.cos_sim(emb_citation, emb_sentences)[0]
+        best_score = float(similarity_scores.max().item())
+
+        is_verified = best_score >= threshold
+        return is_verified, round(best_score, 4)
