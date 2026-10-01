@@ -14,9 +14,6 @@ import re
 load_dotenv()
 
 
-import re
-from pypdf import PdfReader
-
 def load_pdf_and_chunk(pdf_path, chunk_size=800, overlap=150):
     """
     Sentence-Aware Recursive Chunking:
@@ -36,7 +33,7 @@ def load_pdf_and_chunk(pdf_path, chunk_size=800, overlap=150):
 
     # Split full text into complete sentences (preserving punctuation)
     sentences = re.split(r'(?<=[.?!])\s+', full_text)
-    
+
     chunks = []
     current_chunk = []
     current_length = 0
@@ -45,14 +42,14 @@ def load_pdf_and_chunk(pdf_path, chunk_size=800, overlap=150):
         sentence = sentence.strip()
         if not sentence:
             continue
-            
+
         sentence_len = len(sentence)
-        
+
         # If adding the sentence exceeds target chunk size, commit the current chunk
         if current_length + sentence_len > chunk_size and current_chunk:
             chunk_str = " ".join(current_chunk).strip()
             chunks.append(chunk_str)
-            
+
             # Create overlapping window by keeping trailing sentences
             overlap_chunk = []
             overlap_len = 0
@@ -62,7 +59,7 @@ def load_pdf_and_chunk(pdf_path, chunk_size=800, overlap=150):
                     overlap_len += len(s)
                 else:
                     break
-            
+
             current_chunk = overlap_chunk
             current_length = sum(len(s) for s in current_chunk)
 
@@ -115,6 +112,8 @@ class HybridIndexer:
         self.groq_client = Groq(api_key=os.getenv('GROQ_API_KEY'))
 
     def search_bm25(self, query, top_k=3):
+        """Returns chunk text only. Kept for backward compatibility with
+        existing callers that don't need scores."""
         tokenized_query = query.lower().split(' ')
         scores = self.bm25.get_scores(tokenized_query)
         top_indices = sorted(
@@ -122,21 +121,44 @@ class HybridIndexer:
         )[:top_k]
         return [self.chunks[i] for i in top_indices]
 
+    def search_bm25_with_scores(self, query, top_k=3):
+        """Returns (chunk_text, bm25_score) tuples, ranked descending by score.
+        Needed for the multi-signal confidence gate in hybrid_rerank_search."""
+        tokenized_query = query.lower().split(' ')
+        scores = self.bm25.get_scores(tokenized_query)
+        top_indices = sorted(
+            range(len(scores)), key=lambda i: scores[i], reverse=True
+        )[:top_k]
+        return [(self.chunks[i], scores[i]) for i in top_indices]
+
     def search_dense(self, query, top_k=3):
         results = self.collection.query(query_texts=[query], n_results=top_k)
         return results['documents'][0]
 
-    def hybrid_rerank_search(self, query, top_k=1, confidence_threshold=0.35):
+    def hybrid_rerank_search(self, query, top_k=1, confidence_threshold=0.05, bm25_threshold=11):
         """
         Retrieves candidate chunks and evaluates relevance with Cross-Encoder.
-        Applies a Confidence Gate to prevent passing irrelevant context to LLM.
+
+        MULTI-SIGNAL CONFIDENCE GATE:
+        A single cross-encoder threshold could not cleanly separate in-scope vs.
+        out-of-scope queries on this corpus (empirically verified: in-scope queries
+        with indirect phrasing sometimes scored as low as genuinely out-of-scope
+        queries). Instead, the gate now requires BOTH the cross-encoder score AND
+        the raw BM25 score to be weak before blocking a query — a query is let
+        through if EITHER signal independently suggests it's relevant.
+
+        bm25_threshold MUST be calibrated against your own corpus and query set
+        before trusting the default here — see eval.py's calibration step.
         """
-        bm25_hits = self.search_bm25(query, top_k=3)
+        bm25_hits_scored = self.search_bm25_with_scores(query, top_k=3)
+        best_bm25_score = bm25_hits_scored[0][1] if bm25_hits_scored else 0.0
+        bm25_hits = [chunk for chunk, score in bm25_hits_scored]
+
         dense_hits = self.search_dense(query, top_k=3)
 
         candidate_chunks = list(set(bm25_hits + dense_hits))
         pairs = [[query, chunk] for chunk in candidate_chunks]
-        
+
         # Predict normalized probabilities via Sigmoid activation
         scores = self.reranker.predict(pairs)
 
@@ -146,9 +168,12 @@ class HybridIndexer:
 
         top_chunk, top_score = scored_chunks[0]
 
-        # 🛑 PRE-GENERATION CONFIDENCE GATE
-        # If the highest reranking score is below threshold, context is irrelevant
-        is_relevant = float(top_score) >= confidence_threshold
+        # 🛑 MULTI-SIGNAL CONFIDENCE GATE
+        # Block only if BOTH the cross-encoder AND BM25 independently say "weak match."
+        # Passing on EITHER strong signal reduces false positives vs. a single-signal gate.
+        ce_says_relevant = float(top_score) >= confidence_threshold
+        bm25_says_relevant = best_bm25_score >= bm25_threshold
+        is_relevant = ce_says_relevant or bm25_says_relevant
 
         return top_chunk, round(float(top_score), 4), is_relevant
 
@@ -169,8 +194,10 @@ class HybridIndexer:
         JSON Output:
         """
 
+        GROQ_MODEL = os.getenv('GROQ_MODEL', 'openai/gpt-oss-120b')
+
         response = self.groq_client.chat.completions.create(
-            model='llama-3.3-70b-versatile',
+            model= GROQ_MODEL,
             messages=[{'role': 'user', 'content': prompt}],
             temperature=0.0,  # Zero temperature for deterministic grounding
             response_format={'type': 'json_object'},
@@ -186,7 +213,7 @@ class HybridIndexer:
 
     def verify_citation(self, cited_sentence, retrieved_chunk, threshold=0.45):
         """
-        Splits the retrieved chunk into individual sentences and compares 
+        Splits the retrieved chunk into individual sentences and compares
         the citation against the best matching sentence rather than the entire 800-char block.
         """
         if not cited_sentence or cited_sentence == "N/A":
